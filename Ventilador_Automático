@@ -1,0 +1,644 @@
+#include "Arduino.h"
+#include <DHT.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <SPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <TouchScreen.h>
+
+
+// Define o pino e tipo do sensor DHT
+#define DHTPIN 17
+#define DHTTYPE DHT11
+
+// Configuração do MQ
+#define MQ_PIN 32
+#define GAS_THRESHOLD 5000
+
+// Configuração do Fan PWM
+#define FAN_PIN 4
+#define PWM_FREQUENCY 5000
+#define PWM_RESOLUTION 8
+
+// Configuração do buzzer
+#define BUZZER_PIN 13
+#define LED_buzzer 15
+#define BUZZER_FREQUENCY 1000
+
+// Valores limites
+volatile float TEMPERATURE_THRESHOLD_LOW = 25.0;   // Temperatura mínima para ativar ventoinha
+volatile float TEMPERATURE_THRESHOLD_HIGH = 30.0;  // Temperatura máxima para ativar a velocidade máxima da ventoinha
+volatile float HUMIDITY_THRESHOLD_LOW = 65.0;      // Humidade mínima para ativar ventoinha
+volatile float HUMIDITY_THRESHOLD_HIGH = 75.0;     // Humidade máxima para ativar a velocidade máxima da ventoinha
+
+// Definição do LCD
+#define TFT_CS   5
+#define TFT_DC   26
+#define TFT_MOSI 23
+#define TFT_MISO 19
+#define TFT_SCLK 18
+#define TFT_RST -1
+
+//Configuração do pino contador de pulsos
+#define FAN_SENSOR_PIN 12
+
+// Variáveis
+volatile unsigned long pulseCount = 0;  // Contador de pulsos
+unsigned long lastPulseTime = 0;        // Armazena o tempo do último cálculo de RPM
+float rpm = 0.0;						// Valor inicial da rotação
+unsigned long lastDebounceTimeChange = 0;
+unsigned long lastDebounceTimeSelect = 0;
+const unsigned long debounceDelay = 50; // tempo do Debouce                    //varíavel para a função checkbuton
+volatile int tresh = 0;
+//variável para indicar qual threshold está selecionado
+bool readButton(int pin, bool &lastState, unsigned long &lastDebounceTime);  // função para ver o estado dos botões da placa HY
+bool buttonChangeState = false;
+bool buttonSelectState = false;
+
+//Valores para informação de erro
+float prevTemperature = -999.0;
+float prevHumidity = -999.0;
+float prevGas = -999.0;
+
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+DHT dht(DHTPIN, DHTTYPE);
+
+//Estrutura com valores para processamento
+struct SensorData {
+  float temperature;
+  float humidity;
+  int gasLevel;
+  float fanSpeed;
+
+};
+
+// Queue
+QueueHandle_t sensorQueue;
+QueueHandle_t gasQueue;
+QueueHandle_t rpmQueue;
+
+// Mutex para sincronizar acesso aos dados entre o LCD e o buzzer
+SemaphoreHandle_t dataMutex;
+//Mutex para sincronizar acesso aos dados entre os botões e o menu de leitura de dados
+SemaphoreHandle_t xThresholdMutex;
+
+// Estrutura compartilhada para dados
+SensorData sharedData;
+
+//função para ler os pulsos
+void IRAM_ATTR pulseISR() {
+  pulseCount++;
+}
+
+// Task para ler o sensor DHT
+void TaskReadSensor(void *pvParameters) {
+  for (;;) {
+    SensorData data;
+    data.humidity = dht.readHumidity();
+    data.temperature = dht.readTemperature();
+
+    if (isnan(data.humidity) || isnan(data.temperature)) {
+      Serial.println("Erro ao ler DHT!");
+      data.temperature = -999.0;
+    }
+
+    if (uxQueueSpacesAvailable(sensorQueue) == 0) {
+      xQueueReceive(sensorQueue, NULL, 0);
+    }
+    xQueueSend(sensorQueue, &data, portMAX_DELAY);
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+//Tarefa para processar o sinal dos botões de thresholds
+void readButtonTask(void *parameter) {
+
+
+  for(;;) {
+    int buttonState = digitalRead(14); // Lê o estado do botão azul
+    int buttonState2 = digitalRead(0); // Lê o estado do botão branco
+
+    if (xSemaphoreTake(xThresholdMutex, portMAX_DELAY) == pdTRUE) {
+    if (buttonState == LOW && tresh == 1 && TEMPERATURE_THRESHOLD_LOW < TEMPERATURE_THRESHOLD_HIGH) {
+      Serial.println("Botão pressionado!");
+      TEMPERATURE_THRESHOLD_LOW = TEMPERATURE_THRESHOLD_LOW + 1;
+
+    }
+    if (buttonState2 == LOW && tresh == 1 && TEMPERATURE_THRESHOLD_LOW > 15) {
+      Serial.println("Botão pressionado!");
+      TEMPERATURE_THRESHOLD_LOW = TEMPERATURE_THRESHOLD_LOW - 1;
+    }
+    if (buttonState == LOW && tresh == 2) {
+      Serial.println("Botão pressionado!");
+      TEMPERATURE_THRESHOLD_HIGH = TEMPERATURE_THRESHOLD_HIGH + 1;
+    }
+    if (buttonState2 == LOW && tresh == 2 && TEMPERATURE_THRESHOLD_HIGH > TEMPERATURE_THRESHOLD_LOW) {
+      Serial.println("Botão pressionado!");
+      TEMPERATURE_THRESHOLD_HIGH = TEMPERATURE_THRESHOLD_HIGH - 1;
+    }
+    if (buttonState == LOW && tresh == 3 && HUMIDITY_THRESHOLD_LOW < HUMIDITY_THRESHOLD_HIGH) {
+      Serial.println("Botão pressionado!");
+      HUMIDITY_THRESHOLD_LOW = HUMIDITY_THRESHOLD_LOW + 1;
+    }
+    if (buttonState2 == LOW && tresh == 3) {
+      Serial.println("Botão pressionado!");
+      HUMIDITY_THRESHOLD_LOW = HUMIDITY_THRESHOLD_LOW - 1;
+    }
+    if (buttonState == LOW && tresh == 4 && HUMIDITY_THRESHOLD_HIGH < 99) {
+      Serial.println("Botão pressionado!");
+      HUMIDITY_THRESHOLD_HIGH = HUMIDITY_THRESHOLD_HIGH + 1;
+    }
+    if (buttonState2 == LOW && tresh == 4 && HUMIDITY_THRESHOLD_HIGH > HUMIDITY_THRESHOLD_LOW) {
+      Serial.println("Botão pressionado!");
+      HUMIDITY_THRESHOLD_HIGH = HUMIDITY_THRESHOLD_HIGH - 1;
+    }
+    xSemaphoreGive(xThresholdMutex);
+       }
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+// Task para ler o sensor MQ
+void TaskReadGasSensor(void *pvParameters) {
+  for (;;) {
+    SensorData gasData;
+    gasData.gasLevel = analogRead(MQ_PIN);
+
+    if (uxQueueSpacesAvailable(gasQueue) == 0) {
+      xQueueReceive(gasQueue, NULL, 0);
+    }
+
+    xQueueSend(gasQueue, &gasData, portMAX_DELAY);
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+// Estados do menu
+enum MenuState {
+  MENU_MAIN,
+  MENU_READINGS,
+  MENU_THRESHOLDS
+};
+
+//Estado inicial
+MenuState selectedMenu = MENU_MAIN;
+
+// Task principal (Brain)
+void TaskBrain(void *pvParameters) {
+	//ledcAttach(FAN_PIN, PWM_FREQUENCY, PWM_RESOLUTION); // Pino de saída do PWM da ventoinha
+	ledcAttachChannel(FAN_PIN, PWM_FREQUENCY, PWM_RESOLUTION, 1);
+  for (;;) {
+    SensorData sensorData;
+    SensorData gasData;
+    volatile int fanSpeed;
+
+    // Processa dados de temperatura e humidade
+
+        if (xQueueReceive(sensorQueue, &sensorData, pdMS_TO_TICKS(1000)) == pdPASS)
+
+        	{
+          if (sensorData.temperature == -999.0) {
+            Serial.println("ERROR: Temperature sensor failed!");
+          } else
+            // Processa dados de temperatura e humidade para controle do ventilador
+            if (sensorData.temperature >= TEMPERATURE_THRESHOLD_HIGH ||
+                sensorData.humidity >= HUMIDITY_THRESHOLD_HIGH ) {
+              fanSpeed = 1024;  // Velocidade máxima
+            } else if (sensorData.temperature >= TEMPERATURE_THRESHOLD_LOW ||
+                       sensorData.humidity >= HUMIDITY_THRESHOLD_LOW) {
+              fanSpeed = 650;  // Velocidade média
+            } else {
+              fanSpeed = 0;    // Desligado ou baixa velocidade
+            }
+}
+            // Envia a velocidade do fan para o struct sensorData
+
+            if (xQueueReceive(gasQueue, &gasData, pdMS_TO_TICKS(1000)) == pdPASS) {
+              sensorData.gasLevel = gasData.gasLevel;
+             }
+            if(gasData.gasLevel > GAS_THRESHOLD)
+            {
+            	fanSpeed = 1024;
+            }
+
+            sensorData.fanSpeed = fanSpeed;
+            ledcWrite(FAN_PIN, fanSpeed);
+
+
+    // Atualiza os dados compartilhados usando o mutex
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(500))) {
+      sharedData = sensorData;
+
+      xSemaphoreGive(dataMutex);
+    }
+
+    Serial.print("Temp: ");
+    Serial.print(sensorData.temperature);
+    Serial.print(" C, Humidity: ");
+    Serial.print(sensorData.humidity);
+    Serial.print(" %, Gas Level: ");
+    Serial.print(sensorData.gasLevel);
+    Serial.print(", Fan Speed: ");
+    Serial.println(sensorData.fanSpeed);
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+//Tarefa para processar os botões de controlo entre menus e dentro do menu de thresholds
+void TaskHandleButtons(void *pvParameters) {
+
+  for (;;) {
+    // Alterna entre menus
+	  if (readButton(34, buttonChangeState, lastDebounceTimeChange)) {
+		  if(selectedMenu == MENU_MAIN ){
+		  			  selectedMenu = MENU_READINGS;
+		  			  buttonChangeState = false;
+		  			  lastDebounceTimeChange = 0;
+		  			  tft.fillScreen(ILI9341_BLACK);
+		  		  }else if( selectedMenu == MENU_READINGS)
+		  		  {selectedMenu = MENU_THRESHOLDS;
+		  		  buttonChangeState = false;
+		  		  tft.fillScreen(ILI9341_BLACK);
+		  		  lastDebounceTimeChange = 0;
+		  		  }else if (selectedMenu == MENU_THRESHOLDS){
+		  	    selectedMenu = MENU_READINGS;
+		  	    lastDebounceTimeChange = 0;
+		  	    buttonChangeState = false;
+		  	    tft.fillScreen(ILI9341_BLACK);
+		  		  }
+	  }
+
+    // Seleciona o menu atual
+    if (readButton(22, buttonSelectState, lastDebounceTimeSelect))
+
+    	{
+    		if(tresh <= 4)
+    		{tresh = tresh + 1;
+    		} if( tresh > 4){
+    			tresh = 1;
+    		} if(selectedMenu == MENU_THRESHOLDS)
+    	{
+    		if(tresh == 1)
+    		{	tft.fillRect(250, 170, 50, 20,ILI9341_BLACK);
+    			tft.setCursor(250, 50);
+    			      tft.print("<-- ");
+    		}
+    		if(tresh == 2)
+    		{
+    			tft.fillRect(250, 50, 50, 20,ILI9341_BLACK);
+    			tft.setCursor(250, 90);
+    			      tft.print("<-- ");
+    		}
+    		if(tresh == 3)
+    		    		{
+    		    			tft.fillRect(250, 90, 50, 20,ILI9341_BLACK);
+    		    			tft.setCursor(250, 130);
+    		    			      tft.print("<-- ");
+    		    		}
+    		if(tresh == 4)
+    		    		{
+    		    			tft.fillRect(250, 130, 50, 20,ILI9341_BLACK);
+    		    			tft.setCursor(250, 170);
+    		    			      tft.print("<-- ");
+    		    		}
+    	}
+
+    		lastDebounceTimeChange = 0;
+    		buttonSelectState = false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100)); // Evita loop rápido demais
+  }
+}
+
+// Task para desenhar menus diferentes com base no estado selecionado
+void TaskDrawMenus(void *pvParameters) {
+	int barX = 10;			 // Posição X inicial
+	int barY = 200;          // Posição Y inicial
+	int barWidth = 300;      // Largura total da barra
+	int barHeight = 20;      // Altura da barra
+	float prevrpm = 1;
+
+  for (;;) {
+    if (selectedMenu == MENU_MAIN) {
+
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setTextSize(2);
+
+      tft.setCursor(50, 20);
+      tft.print("Main Menu");
+
+      // Botões no menu principal
+      tft.fillRect(40, 80, 240, 60, ILI9341_BLUE);
+      tft.setCursor(90, 100);
+      tft.print("Readings");
+
+      tft.fillRect(40, 180, 240, 60, ILI9341_GREEN);
+      tft.setCursor(85, 200);
+      tft.print("Thresholds");
+    } else if (selectedMenu == MENU_READINGS) {
+      // Mostra leituras dos sensores
+
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setTextSize(2);
+
+      tft.setCursor(10, 10);
+      tft.print("Sensor Readings:");
+
+      tft.setCursor(10,40);
+      tft.print("Temp:");
+
+      if (sharedData.temperature != prevTemperature) {
+                      // Limpa somente a área do valor da temperatura
+                      tft.fillRect(80, 40, 100, 30, ILI9341_BLACK); // Ajuste os valores conforme o layout
+                      tft.setCursor(80, 40);
+                      tft.print(sharedData.temperature);
+                      tft.print(" C");
+                      prevTemperature = sharedData.temperature;
+                  }else{
+                	  tft.setCursor(80, 40);
+                	                        tft.print(sharedData.temperature);
+                	                        tft.print(" C");
+                  }
+
+      tft.setCursor(10, 70);
+      tft.print("Humidity: ");
+
+      if (sharedData.humidity != prevHumidity) {
+                      tft.fillRect(130, 70, 100, 30, ILI9341_BLACK); // Ajuste para a área da humidade
+                      tft.setCursor(130, 70);
+                      tft.print(sharedData.humidity);
+                      tft.print(" %");
+                      prevHumidity = sharedData.humidity;
+                  }else{
+                	  tft.setCursor(130, 70);
+                	  tft.print(sharedData.humidity);
+                	                        tft.print(" %");
+                  }
+
+      tft.setCursor(10, 100);
+      tft.print("Gas Level: ");
+
+      if (sharedData.gasLevel != prevGas) {
+                      tft.fillRect(140, 100, 100, 30, ILI9341_BLACK); // Ajuste para a área do gás
+                      tft.setCursor(140, 100);
+                      tft.print(sharedData.gasLevel);
+                      tft.print(" ppm");
+                      prevGas = sharedData.gasLevel;
+                  }
+
+      tft.fillRect(10, 160, 320, 30, ILI9341_BLACK); // Limpa a área de velocidade do ventilador
+                    tft.setCursor(10, 130);
+                    if(rpm < 5800)
+                    {
+                    tft.print("Fan Speed: ");
+                    if (rpm != prevrpm) {
+                                          tft.fillRect(140, 130, 100, 30, ILI9341_BLACK); // Ajuste para a área do gás
+                                          tft.setCursor(140, 130);
+                                          tft.print(rpm, 0);
+                                          tft.print(" RPM");
+
+                                      }
+
+
+                    tft.fillRect(barX, barY, barWidth, barHeight, ILI9341_BLACK);
+                                        // Calcula a proporção da velocidade (0 a 255) para preencher a barra
+                                                 float filledWidth = map(rpm, 0, 5800, 0, barWidth);
+
+                                                 // Gradiente de verde a vermelho
+                                                 for (int i = 0; i < filledWidth; i++) {
+                                                   // Calcula a cor interpolada do gradiente
+                                                   uint16_t color = tft.color565(
+                                                     map(i, 0, barWidth, 0, 255),   // R: aumenta com a largura
+                                                     map(i, 0, barWidth, 255, 0),   // G: diminui com a largura
+                                                     0                              // B: sempre 0
+                                                   );
+                                                   tft.drawFastVLine(barX + i, barY, barHeight, color);  // Desenha a linha
+                                                 }
+
+                                                 // Moldura da barra
+                                                 tft.drawRect(barX, barY, barWidth, barHeight, ILI9341_WHITE);
+
+                    }
+                    prevrpm = rpm;
+
+
+    } else if (selectedMenu == MENU_THRESHOLDS) {
+      // Permite ajuste dos thresholds
+
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setTextSize(2);
+
+      tft.setCursor(10, 10);
+      tft.print("Adjust Thresholds:");
+
+      tft.setCursor(10, 50);
+      tft.print("Temp Low: ");
+      tft.fillRect(120, 50, 70, 30, ILI9341_BLACK);
+      tft.print(TEMPERATURE_THRESHOLD_LOW);
+
+      tft.setCursor(10, 90);
+      tft.print("Temp High: ");
+      tft.fillRect(130, 90, 70, 30, ILI9341_BLACK);
+      tft.print(TEMPERATURE_THRESHOLD_HIGH);
+
+      tft.setCursor(10, 130);
+      tft.print("Humidity Low: ");
+      tft.fillRect(170, 130, 70, 30, ILI9341_BLACK);
+      tft.print(HUMIDITY_THRESHOLD_LOW);
+
+      tft.setCursor(10, 170);
+      tft.print("Humidity High: ");
+      tft.fillRect(180, 170, 70, 30, ILI9341_BLACK);
+      tft.print(HUMIDITY_THRESHOLD_HIGH);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(500)); // Atualiza a cada meio segundo
+  }
+}
+
+
+// Task para controlar o buzzer
+void TaskControlBuzzer(void *pvParameters) {
+	                          // Set buzzer pin as output
+
+	//ledcAttach(BUZZER_PIN, BUZZER_FREQUENCY, 10); // Pino de saída do PWM da ventoinha
+	ledcAttachChannel(BUZZER_PIN, BUZZER_FREQUENCY, 10, 0);
+      for (;;) {
+      SensorData localData;
+      int priority = 4;
+
+    // Lê os dados compartilhados com proteção de mutex
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1000))) {
+      localData = sharedData;
+      xSemaphoreGive(dataMutex);
+    }
+    if (localData.gasLevel > GAS_THRESHOLD) {
+    	if(priority != 6){
+      vTaskPrioritySet(NULL, 6);}
+      Serial.println("Buzzer ON");
+      digitalWrite(LED_buzzer, HIGH);
+      ledcWriteTone(BUZZER_PIN, BUZZER_FREQUENCY);
+      priority = 6;
+
+    } else {
+    	if(priority != 4)
+    	{
+      vTaskPrioritySet(NULL, 4);}
+      Serial.println("Buzzer OFF");
+      digitalWrite(LED_buzzer, LOW);
+      ledcWriteTone(BUZZER_PIN, 0);
+      priority = 4;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+	// Task para calcular o RPM apartir dos pulsos
+	void TaskReadFanRPM(void *pvParameters) {
+  for (;;) {
+    unsigned long currentTime = millis();
+    float prevrpm;
+    SensorData sensorData;
+
+
+    if (currentTime - lastPulseTime >= 1000) {
+      rpm = (pulseCount / 2.0) * 60.0;  // RPM = (pulsos por segundo / 2) * 60
+      pulseCount = 0;  // Reset ao contador de pulsos
+      lastPulseTime = currentTime;
+      if (rpm != prevrpm) {
+              // Envia o valor de RPM para a queue
+              if (uxQueueSpacesAvailable(rpmQueue) > 0) {
+                xQueueSend(rpmQueue, &rpm, portMAX_DELAY);
+              }
+      }
+      Serial.print("RPM: ");
+      Serial.println(rpm);
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));  // Delay de 100ms para evitar consumir 100% da CPU
+}
+	}
+
+	// Função para verificar o estado do botão
+	bool readButton(int pin, bool &lastState, unsigned long &lastDebounceTime) {
+	  bool reading = digitalRead(pin);
+	  if (reading != lastState) {
+	    lastDebounceTime = millis();
+	  }
+	  if ((millis() - lastDebounceTime) > debounceDelay) {
+	    if (reading == LOW) { // LOW significa botão pressionado
+	      lastState = !lastState; // Alterna o estado
+	      return true;
+	    }
+	  }
+	  return false;
+	}
+
+	// Função para desenhar o ecrã de início
+	void showSplashScreen() {
+
+
+		// Limpa a tela com a cor preta
+		  tft.fillScreen(ILI9341_BLACK);
+
+		  // 1. Animação: Linha crescendo de esquerda para direita
+		  int lineY = 30; // Posição vertical da linha
+		  for (int x = 0; x <= 320; x += 5) {
+		    tft.drawFastHLine(0, lineY, x, ILI9341_WHITE); // Desenha linha horizontal crescendo
+		    delay(10); // Pequeno atraso para criar o efeito
+		  }
+
+		  // 2. Escreve o título após a animação
+		  tft.fillRect(0, 0, 320, 40, ILI9341_BLUE); // Fundo azul no topo
+		  tft.setTextColor(ILI9341_WHITE);
+		  tft.setTextSize(2); // Tamanho da fonte
+		  tft.setCursor((320 - (17 * 12)) / 2, 10); // Centraliza "Engenharia Automóvel"
+		  tft.print("Engenharia Automovel");
+
+		  // 3. Desenha o retângulo com "SEEV"
+		  int rectWidth = 200;
+		  int rectHeight = 60;
+		  int rectX = (320 - rectWidth) / 2; // Centraliza horizontalmente
+		  int rectY = (240 - rectHeight) / 2 - 20; // Centraliza verticalmente com ajuste
+
+		  tft.fillRect(rectX, rectY, rectWidth, rectHeight, ILI9341_GREEN);
+		  tft.drawRect(rectX, rectY, rectWidth, rectHeight, ILI9341_WHITE);
+
+		  tft.setTextSize(3);
+		  tft.setCursor(rectX + (rectWidth - (4 * 6 * 3)) / 2, rectY + (rectHeight - (8 * 3)) / 2);
+		  tft.setTextColor(ILI9341_WHITE);
+		  tft.print("SEEV");
+
+		  // 4. Animação: Bolas que aparecem abaixo do retângulo
+		  int circleY = rectY + rectHeight + 20; // Linha base para as bolas
+		  for (int i = 0; i < 5; i++) {
+		    tft.fillCircle(60 + (i * 50), circleY, 10, ILI9341_CYAN); // Desenha bolas
+		    delay(300); // Atraso para criar efeito de entrada
+		  }
+
+		  // 5. Escreve os nomes abaixo das bolas
+		  tft.setTextSize(2);
+
+		  tft.setCursor((320 - (12 * 14)) / 2, circleY + 20);
+		  tft.setTextColor(ILI9341_CYAN);
+		  tft.print("Isac Medeiros");
+
+		  tft.setCursor((320 - (12 * 14)) / 2, circleY + 50);
+		  tft.setTextColor(ILI9341_YELLOW);
+		  tft.print("Bruno Carvalho");
+
+		  // 6. Adiciona delay e limpa antes de continuar
+		  delay(5000); // Mostra a tela por 5 segundos
+		  tft.fillScreen(ILI9341_BLACK); // Limpa a tela
+	}
+
+
+void setup() {
+
+  Serial.begin(115200); // inicialização da porta série
+  dht.begin(); // inicialização do sensor de Temperatura e humidade
+  tft.begin(); // inicialização do ecrã TFT
+  tft.setRotation(3);
+  showSplashScreen(); // função para mostrar o ecrã de inicialização
+  tft.fillScreen(ILI9341_BLACK);
+
+  sensorQueue = xQueueCreate(10, sizeof(SensorData)); // Queue dos valores dos sensores
+  gasQueue = xQueueCreate(10, sizeof(SensorData)); // Queue para os valores dos gases
+  rpmQueue = xQueueCreate(10, sizeof(float)); // Queue para os valores do RPM da ventoinha
+
+  pinMode(BUZZER_PIN, OUTPUT); // Pino do Buzzer de aviso de gases
+  pinMode(FAN_SENSOR_PIN, INPUT_PULLUP);   // Pino de entrada com pull-up do contador de pulsos
+  pinMode(LED_buzzer, OUTPUT); // Led de aviso de gases
+  pinMode(34, INPUT_PULLUP); // botão mudar entre menus
+  pinMode(22, INPUT_PULLUP); // botão mudar entre thresholds
+  attachInterrupt(digitalPinToInterrupt(FAN_SENSOR_PIN), pulseISR, RISING);  // Interrupção na borda ascendente
+  pinMode(14, INPUT_PULLUP); // botão azul
+  pinMode(0, INPUT_PULLUP); // botão branco
+
+  // Inicializa o mutex
+  dataMutex = xSemaphoreCreateMutex(); // Mutex de proteção dos dados do sensor de gases
+  xThresholdMutex = xSemaphoreCreateMutex(); // Mutex de proteção dos dados dos thresholds
+
+  xTaskCreate(TaskReadSensor, "ReadSensor", 2048, NULL, 5, NULL);
+  xTaskCreate(TaskReadGasSensor, "ReadGasSensor", 2048, NULL, 5, NULL);
+  xTaskCreate(TaskBrain, "Brain", 2048, NULL, 4, NULL);
+  xTaskCreate(TaskControlBuzzer, "ControlBuzzer", 2048, NULL, 4, NULL);
+  xTaskCreate(TaskReadFanRPM, "ReadFanRPM", 2048, NULL, 3, NULL);
+  xTaskCreate(TaskDrawMenus, "DrawMenus", 2048, NULL, 1, NULL);
+  xTaskCreate(TaskHandleButtons, "HandleButtons", 2048, NULL, 2, NULL);
+  xTaskCreate(readButtonTask,"Read Button", 1024, NULL, 2, NULL);
+
+}
+
+void loop() {
+  // O loop está vazio porque as tasks são gerenciadas pelo FreeRTOS
+	vTaskDelete(NULL);
+}
